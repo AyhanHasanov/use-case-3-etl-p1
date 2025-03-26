@@ -1,4 +1,7 @@
 [Линк към DEMO видео.](https://drive.google.com/file/d/1xV8vYAMWZk_o8Rh8UJ-sskaIchkZ8IDW/view?usp=sharing)
+
+
+
 [Линк към SQL файла](https://github.com/AyhanHasanov/use-case-3-etl-p1/blob/main/sql/queries.sql)
 ## Преглед
 
