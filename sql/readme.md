@@ -1,3 +1,5 @@
+#c5f015 https://drive.google.com/file/d/1xV8vYAMWZk_o8Rh8UJ-sskaIchkZ8IDW/view?usp=sharing
+
 ## Преглед
 
 Този SQL скрипт имплементира следното:
