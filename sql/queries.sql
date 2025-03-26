@@ -1,6 +1,6 @@
-DROP DATABASE IF EXISTS ecomerse_db_etl;
-CREATE DATABASE IF NOT EXISTS ecomerse_db_etl;
-USE ecomerse_db_etl;
+DROP DATABASE IF EXISTS ecommerce_db;
+CREATE DATABASE IF NOT EXISTS ecommerce_db;
+USE ecommerce_db;
 
 CREATE SCHEMA IF NOT EXISTS stage_external;
 USE SCHEMA stage_external;
@@ -9,8 +9,8 @@ CREATE OR REPLACE STAGE stage_external.ec_stage
 URL = 's3://fakecompanydata/'
 FILE_FORMAT = (TYPE = CSV);
 
-DROP TABLE IF EXISTS stage_external.temp_orders;
-CREATE TEMPORARY TABLE IF NOT EXISTS stage_external.temp_orders(
+DROP TABLE IF EXISTS stage_external.raw_orders;
+CREATE TEMPORARY TABLE IF NOT EXISTS stage_external.raw_orders(
     order_id VARCHAR(255),
     customer_id VARCHAR(15), 
     customer_name VARCHAR(255), 
@@ -25,7 +25,7 @@ CREATE TEMPORARY TABLE IF NOT EXISTS stage_external.temp_orders(
     status VARCHAR(255)
 );
 
-COPY INTO stage_external.temp_orders 
+COPY INTO stage_external.raw_orders 
 FROM @stage_external.ec_stage
 FILE_FORMAT = (
     TYPE = CSV,
@@ -38,7 +38,7 @@ MATCH_BY_COLUMN_NAME = 'CASE_INSENSITIVE';
 CREATE SCHEMA IF NOT EXISTS curated;
 USE SCHEMA curated;
 
-CREATE TRANSIENT TABLE curated.clean_orders AS
+CREATE TEMPORARY TABLE curated.clean_orders AS
 SELECT 
     order_id,
     customer_id,
@@ -67,9 +67,10 @@ SELECT
     payment_method,
     shipping_address,
     status
-FROM stage_external.temp_orders
+FROM stage_external.raw_orders
 WHERE order_id IS NOT NULL;
 
+--
 CREATE TEMPORARY TABLE curated.deduplicated_orders AS
 SELECT *
 FROM (
@@ -81,19 +82,8 @@ WHERE row_num = 1;
 
 ALTER TABLE curated.deduplicated_orders DROP COLUMN row_num;
 
---Ако Адреса за доставка липсва, но статуса е Delivered - прехвърлете записа към отделна таблица, която да съдържа само и единствено такива доставки, гонови за ревю, td_for_review
-CREATE TEMPORARY TABLE curated.td_for_review LIKE curated.deduplicated_orders;
-
-INSERT INTO curated.td_for_review
-SELECT *
-FROM curated.deduplicated_orders
-WHERE shipping_address IS NULL AND status = 'Delivered';
-
-DELETE FROM curated.deduplicated_orders
-WHERE order_id IN (SELECT order_id FROM curated.td_for_review);
-
---Ако в записа липсва данни за клиента Customer_id , то тогава този запис трябва да бъде прехвърлен към таблица td_suspisios_records
-CREATE TEMPORARY TABLE curated.td_suspicious_records LIKE curated.deduplicated_orders;
+--Липсва идентификатор на клиент - фундаментално незавършен запис
+CREATE TRANSIENT TABLE curated.td_suspicious_records LIKE curated.clean_orders;
 
 INSERT INTO curated.td_suspicious_records
 SELECT *
@@ -103,81 +93,84 @@ WHERE customer_id IS NULL;
 DELETE FROM curated.deduplicated_orders
 WHERE order_id IN (SELECT order_id FROM curated.td_suspicious_records);
 
---Ако липсва информация за платежния метод, коригирайте със стойност по подразбиране Unknown
-UPDATE curated.deduplicated_orders 
-SET payment_method = 'Unknown'
-WHERE payment_method IS NULL;
 
---Някой от записите имат грешен формат, спрямо другите данни - ще откриете сами за какво говорим. Всеки запис с невалиден формат трябва да се прехвърли към таблица td_invalid_date_format , а финалните записи да се коригират, така че да бъдат в правилния формат.
-CREATE TEMPORARY TABLE curated.td_invalid_date_format LIKE curated.deduplicated_orders;
+--Невалидни дати
+CREATE TRANSIENT TABLE curated.td_invalid_date_format LIKE curated.clean_orders;
+
+INSERT INTO curated.td_invalid_date_format
+SELECT * FROM curated.deduplicated_orders
+WHERE order_date = '1000-01-01';
 
 ALTER TABLE curated.td_invalid_date_format
 ADD COLUMN invalid_date VARCHAR(255);
 
-INSERT INTO curated.td_invalid_date_format
-SELECT
-    dor.order_id, 
-    dor.customer_id, 
-    dor.customer_name, 
-    dor.order_date, 
-    dor.product, 
-    dor.quantity, 
-    dor.price, 
-    dor.discount, 
-    dor.total_amount, 
-    dor.payment_method, 
-    dor.shipping_address, 
-    dor.status,
-    tor.order_date AS "invalid_date"
-FROM curated.deduplicated_orders dor
-JOIN stage_external.temp_orders tor
-ON dor.order_id = tor.order_id
-WHERE dor.order_date = '1000-01-01'
-UNION
-SELECT 
-    dor.order_id, 
-    dor.customer_id, 
-    dor.customer_name, 
-    dor.order_date, 
-    dor.product, 
-    dor.quantity, 
-    dor.price, 
-    dor.discount, 
-    dor.total_amount, 
-    dor.payment_method, 
-    dor.shipping_address, 
-    dor.status,
-    tor.order_date AS "invalid_date"
-FROM curated.td_for_review dor
-JOIN stage_external.temp_orders tor
-ON dor.order_id = tor.order_id
-WHERE dor.order_date = '1000-01-01'
-UNION 
-SELECT 
-    dor.order_id, 
-    dor.customer_id, 
-    dor.customer_name, 
-    dor.order_date, 
-    dor.product, 
-    dor.quantity, 
-    dor.price, 
-    dor.discount, 
-    dor.total_amount, 
-    dor.payment_method, 
-    dor.shipping_address, 
-    dor.status,
-    tor.order_date AS "invalid_date"
-FROM curated.td_suspicious_records dor
-JOIN stage_external.temp_orders tor
-ON dor.order_id = tor.order_id
-WHERE dor.order_date = '1000-01-01';
+UPDATE curated.td_invalid_date_format
+SET invalid_date = stage_external.raw_orders.order_date
+FROM stage_external.raw_orders
+WHERE curated.td_invalid_date_format.order_id = stage_external.raw_orders.order_id;
 
-DELETE FROM curated.deduplicated_orders
-WHERE order_id IN (SELECT order_id FROM curated.td_invalid_date_format);
+--Невалидна цена или количество
+CREATE TRANSIENT TABLE IF NOT EXISTS curated.td_invalid_price_or_quantity LIKE curated.clean_orders;
 
---Изтриите всички редове, които съдържат невалидни стойности за цена и количество поръчана стока. Тези стойности винаги трябва да бъдат положителни. Прехвърлете заподозрените записи в специфична таблица, с име по ваш избор.
+INSERT INTO curated.td_invalid_price_or_quantity
 SELECT * FROM curated.deduplicated_orders 
 WHERE quantity < 0 OR price < 0;
 
+DELETE FROM curated.deduplicated_orders
+WHERE quantity < 0 OR price < 0;
 
+-- Прехвърляне на записите с невалидни статуси и без адреси
+CREATE TRANSIENT TABLE curated.td_for_review LIKE curated.clean_orders;
 
+INSERT INTO curated.td_for_review
+SELECT *
+FROM curated.deduplicated_orders
+WHERE shipping_address IS NULL AND status IN ('Delivered', 'Shipped'); 
+-- безсмислено е да съществува поръчка, която да е изпратена, без адрес на получаване
+
+DELETE FROM curated.deduplicated_orders
+WHERE order_id IN (SELECT order_id FROM curated.td_for_review);
+
+-- Промяна на статуса на поръчките без адрес
+ALTER TABLE curated.td_for_review
+ADD COLUMN old_status VARCHAR(255);
+
+UPDATE curated.td_for_review
+SET old_status = status;
+
+UPDATE curated.td_for_review
+SET status = 'Pending';
+
+-- Оправяне на невалидно намаление
+UPDATE curated.deduplicated_orders
+SET discount = 
+    CASE
+        WHEN discount < 0 THEN 0
+        WHEN discount > 0.5 THEN 0.5
+    END
+WHERE discount < 0 OR discount > 0.5;   
+
+-- Промяна на метода на плащане там, където то не е зададено.
+UPDATE curated.deduplicated_orders 
+SET payment_method = 'Unknown'
+WHERE payment_method IS NULL;
+
+-- Преизчисляване на крайната цена
+UPDATE curated.deduplicated_orders
+SET total_amount = ((quantity * price) * (1 - discount));
+
+CREATE SCHEMA IF NOT EXISTS production;
+USE SCHEMA production;
+
+CREATE TABLE IF NOT EXISTS orders LIKE curated.clean_orders;
+CREATE TRANSIENT TABLE IF NOT EXISTS td_for_review LIKE curated.td_for_review;
+
+-- Наливане на информация в двете таблици, които ще се ползват
+--Валидирани
+--В тази таблица са всички поръчки
+INSERT INTO orders
+SELECT * FROM curated.deduplicated_orders;
+
+-- В тази таблица са поръчките, които трябва да бъдат преразгледани и променени
+INSERT INTO td_for_review
+SELECT * FROM curated.td_for_review;
